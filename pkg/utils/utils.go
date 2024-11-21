@@ -338,7 +338,7 @@ func GetDockerHost() string {
 		return dh
 	}
 
-	return "/var/run/docker.sock"
+	return "unix:///var/run/docker.sock"
 }
 
 // GetDockerIP returns the location of the Docker Server IP address
