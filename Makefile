@@ -49,7 +49,7 @@ dagger_release:
 		--src=.  
 
 generate_mocks:
-	go install github.com/vektra/mockery/v2@v2.20.0
+	go install github.com/vektra/mockery/v2@v2.46.0
 	go generate ./...
 
 install_local:

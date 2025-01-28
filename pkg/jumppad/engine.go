@@ -5,6 +5,7 @@ import (
 	// "fmt"
 
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"os"
@@ -39,6 +40,12 @@ type Engine interface {
 	Destroy(ctx context.Context, force bool) error
 	Config() *hclconfig.Config
 	Diff(path string, variables map[string]string, variablesFile string) (new []types.Resource, changed []types.Resource, removed []types.Resource, cfg *hclconfig.Config, err error)
+	Events() (<-chan Event, error)
+}
+
+type Event struct {
+	Resource types.Resource
+	Status   constants.LifecycleEvent
 }
 
 // EngineImpl is responsible for creating and destroying resources
@@ -48,6 +55,7 @@ type EngineImpl struct {
 	config    *hclconfig.Config
 	ctx       context.Context
 	force     bool
+	events    chan Event
 }
 
 // New creates a new Jumppad engine
@@ -98,6 +106,10 @@ func (e *EngineImpl) ParseConfigWithVariables(path string, vars map[string]strin
 
 	err = e.readAndProcessConfig(path, vars, variablesFile, func(r types.Resource) error {
 		e.config.AppendResource(r)
+		e.emitLifecycleEvent(Event{
+			Resource: r,
+			Status:   constants.LifecycleEventParsed,
+		})
 		return nil
 	})
 
@@ -360,6 +372,15 @@ func (e *EngineImpl) ResourceCountForType(t string) int {
 	return len(r)
 }
 
+// Events returns the events channels to broadcast resource lifecycle events
+func (e *EngineImpl) Events() (<-chan Event, error) {
+	if e.events != nil {
+		return nil, errors.New("events channel already created")
+	}
+	e.events = make(chan Event)
+	return e.events, nil
+}
+
 func (e *EngineImpl) readAndProcessConfig(path string, variables map[string]string, variablesFile string, callback hclconfig.WalkCallback) error {
 	var parseError error
 	var parsedConfig *hclconfig.Config
@@ -468,14 +489,28 @@ func (e *EngineImpl) appendDisabledResources(c *hclconfig.Config) error {
 }
 
 func (e *EngineImpl) createCallback(r types.Resource) error {
+	e.emitLifecycleEvent(Event{
+		Resource: r,
+		Status:   constants.LifecycleEventCreating,
+	})
+	lifecycleStatus := constants.LifecycleEventCreated
+	defer func() {
+		e.emitLifecycleEvent(Event{
+			Resource: r,
+			Status:   lifecycleStatus,
+		})
+	}()
+
 	// if the context is cancelled skip
 	if e.ctx.Err() != nil {
+		lifecycleStatus = constants.LifecycleEventCreatedFailed
 		return nil
 	}
 
 	p := e.providers.GetProvider(r)
 	if p == nil {
 		r.Metadata().Properties[constants.PropertyStatus] = constants.StatusFailed
+		lifecycleStatus = constants.LifecycleEventCreatedFailed
 		return fmt.Errorf("unable to create provider for resource Name: %s, Type: %s", r.Metadata().Name, r.Metadata().Type)
 	}
 
@@ -489,6 +524,7 @@ func (e *EngineImpl) createCallback(r types.Resource) error {
 		// remove the resource, we will add the new version to the state
 		err = e.config.RemoveResource(r)
 		if err != nil {
+			lifecycleStatus = constants.LifecycleEventCreatedFailed
 			return fmt.Errorf(`unable to remove resource "%s" from state, %s`, r.Metadata().ID, err)
 		}
 	}
@@ -498,6 +534,7 @@ func (e *EngineImpl) createCallback(r types.Resource) error {
 	case constants.StatusCreated:
 		providerError = p.Refresh(e.ctx)
 		if providerError != nil {
+			lifecycleStatus = constants.LifecycleEventCreatedFailed
 			r.Metadata().Properties[constants.PropertyStatus] = constants.StatusFailed
 		}
 
@@ -511,15 +548,18 @@ func (e *EngineImpl) createCallback(r types.Resource) error {
 	case constants.StatusFailed:
 		providerError = p.Destroy(e.ctx, false)
 		if providerError != nil {
+			lifecycleStatus = constants.LifecycleEventCreatedFailed
 			r.Metadata().Properties[constants.PropertyStatus] = constants.StatusFailed
 		}
 
 		fallthrough // failed resources should always attempt recreation
 
 	default:
+		lifecycleStatus = constants.LifecycleEventCreated
 		r.Metadata().Properties[constants.PropertyStatus] = constants.StatusCreated
 		providerError = p.Create(e.ctx)
 		if providerError != nil {
+			lifecycleStatus = constants.LifecycleEventCreatedFailed
 			r.Metadata().Properties[constants.PropertyStatus] = constants.StatusFailed
 		}
 	}
@@ -527,6 +567,7 @@ func (e *EngineImpl) createCallback(r types.Resource) error {
 	// add the resource to the state
 	err = e.config.AppendResource(r)
 	if err != nil {
+		lifecycleStatus = constants.LifecycleEventCreatedFailed
 		return fmt.Errorf(`unable add resource "%s" to state, %s`, r.Metadata().ID, err)
 	}
 
@@ -593,6 +634,18 @@ func (e *EngineImpl) createCallback(r types.Resource) error {
 }
 
 func (e *EngineImpl) destroyCallback(r types.Resource) error {
+	e.emitLifecycleEvent(Event{
+		Resource: r,
+		Status:   constants.LifecycleEventDestroying,
+	})
+	lifecycleStatus := constants.LifecycleEventDestroyed
+	defer func() {
+		e.emitLifecycleEvent(Event{
+			Resource: r,
+			Status:   lifecycleStatus,
+		})
+	}()
+
 	// if the context is cancelled skip
 	if e.ctx.Err() != nil {
 		return nil
@@ -611,12 +664,14 @@ func (e *EngineImpl) destroyCallback(r types.Resource) error {
 	p := e.providers.GetProvider(r)
 
 	if p == nil {
+		lifecycleStatus = constants.LifecycleEventDestroyFailed
 		r.Metadata().Properties[constants.PropertyStatus] = constants.StatusFailed
 		return fmt.Errorf("unable to create provider for resource Name: %s, Type: %s", r.Metadata().Name, r.Metadata().Type)
 	}
 
 	err := p.Destroy(e.ctx, e.force)
 	if err != nil && !e.force {
+		lifecycleStatus = constants.LifecycleEventDestroyFailed
 		r.Metadata().Properties[constants.PropertyStatus] = constants.StatusFailed
 		return fmt.Errorf("unable to destroy resource Name: %s, Type: %s, Error: %s", r.Metadata().Name, r.Metadata().Type, err)
 	}
@@ -625,6 +680,12 @@ func (e *EngineImpl) destroyCallback(r types.Resource) error {
 	e.config.RemoveResource(r)
 
 	return nil
+}
+
+func (e *EngineImpl) emitLifecycleEvent(event Event) {
+	if e.events != nil {
+		e.events <- event
+	}
 }
 
 // checks if a string exists in an array if not it appends and returns a new

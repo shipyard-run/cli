@@ -99,6 +99,61 @@ func TestApplyWithSingleFile(t *testing.T) {
 	)
 }
 
+func TestApplyWithSingleFileWithEvents(t *testing.T) {
+	e, mp := setupTests(t, nil)
+
+	events, err := e.Events()
+	require.NoError(t, err)
+
+	parsedEventCount := 0
+	creatingEventCount := 0
+	createdEventCount := 0
+
+	go func() {
+		for event := range events {
+			require.Contains(t, []constants.LifecycleEvent{constants.LifecycleEventParsed, constants.LifecycleEventCreating, constants.LifecycleEventCreated}, event.Status)
+			switch event.Status {
+			case constants.LifecycleEventParsed:
+				parsedEventCount += 1
+			case constants.LifecycleEventCreating:
+				creatingEventCount += 1
+			case constants.LifecycleEventCreated:
+				createdEventCount += 1
+			}
+		}
+	}()
+
+	_, err = e.Apply(context.Background(), "../../examples/single_file/container.hcl")
+	require.NoError(t, err)
+
+	require.Len(t, e.config.Resources, 7) // 6 resources in the file plus the image cache
+
+	// Check the provider was called for each resource
+	require.ElementsMatch(t,
+		[]string{
+			"default",
+			"onprem",
+			"default",
+			"consul_config",
+			"port_range",
+			"version",
+		},
+		[]string{
+			getMetaFromMock(mp, 0).Name,
+			getMetaFromMock(mp, 1).Name,
+			getMetaFromMock(mp, 2).Name,
+			getMetaFromMock(mp, 3).Name,
+			getMetaFromMock(mp, 4).Name,
+			getMetaFromMock(mp, 5).Name,
+		},
+	)
+
+	require.Equal(t, 6, parsedEventCount)
+	require.Equal(t, 6, createdEventCount)
+	require.Equal(t, 6, creatingEventCount)
+	require.Empty(t, events)
+}
+
 func TestApplyAddsImageCache(t *testing.T) {
 	e, _ := setupTests(t, nil)
 
@@ -389,6 +444,41 @@ func TestDestroyCallsProviderDestroyForEachProvider(t *testing.T) {
 	require.NoFileExists(t, utils.StatePath())
 }
 
+func TestDestroyCallsProviderDestroyForEachProviderWithEvents(t *testing.T) {
+	e, mp := setupTestsWithState(t, nil, existingState)
+
+	events, err := e.Events()
+	require.NoError(t, err)
+
+	destroyingEventCount := 0
+	destroyedEventCount := 0
+
+	go func() {
+		for event := range events {
+			require.Contains(t, []constants.LifecycleEvent{constants.LifecycleEventDestroying, constants.LifecycleEventDestroyed}, event.Status)
+			switch event.Status {
+			case constants.LifecycleEventDestroying:
+				destroyingEventCount += 1
+			case constants.LifecycleEventDestroyed:
+				destroyedEventCount += 1
+			}
+		}
+	}()
+
+	err = e.Destroy(context.Background(), false)
+	require.NoError(t, err)
+
+	// should have call create for each provider
+	// and once for the image cache
+	testAssertMethodCalled(t, mp, "Destroy", 4)
+
+	// state should be removed
+	require.NoFileExists(t, utils.StatePath())
+	require.Equal(t, 4, destroyingEventCount)
+	require.Equal(t, 4, destroyingEventCount)
+	require.Empty(t, events)
+}
+
 func TestDestroyNotCallsProviderDestroyForResourcesDisabled(t *testing.T) {
 	e, mp := setupTestsWithState(t, nil, disabledState)
 
@@ -426,6 +516,42 @@ func TestDestroyFailSetsStatus(t *testing.T) {
 	require.Equal(t, constants.StatusFailed, r.Metadata().Properties[constants.PropertyStatus])
 }
 
+func TestDestroyFailSetsStatusWithEvents(t *testing.T) {
+	e, _ := setupTestsWithState(t, map[string]error{"mycontainer": fmt.Errorf("boom")}, complexState)
+
+	events, err := e.Events()
+	require.NoError(t, err)
+
+	destroyingEventCount := 0
+	destroyedEventCount := 0
+	destroyFailedEventCount := 0
+
+	go func() {
+		for event := range events {
+			require.Contains(t, []constants.LifecycleEvent{constants.LifecycleEventDestroying, constants.LifecycleEventDestroyed, constants.LifecycleEventDestroyFailed}, event.Status)
+			switch event.Status {
+			case constants.LifecycleEventDestroying:
+				destroyingEventCount += 1
+			case constants.LifecycleEventDestroyed:
+				destroyedEventCount += 1
+			case constants.LifecycleEventDestroyFailed:
+				destroyFailedEventCount += 1
+			}
+		}
+	}()
+
+	err = e.Destroy(context.Background(), false)
+	require.Error(t, err)
+
+	r, _ := e.config.FindResource("resource.container.mycontainer")
+	require.Equal(t, constants.StatusFailed, r.Metadata().Properties[constants.PropertyStatus])
+
+	require.Equal(t, 2, destroyingEventCount)
+	require.Equal(t, 1, destroyedEventCount)
+	require.Equal(t, 1, destroyFailedEventCount)
+	require.Empty(t, events)
+}
+
 func TestParseConfig(t *testing.T) {
 	e, mp := setupTests(t, nil)
 
@@ -435,8 +561,36 @@ func TestParseConfig(t *testing.T) {
 	require.Len(t, r.Resources, 6)
 
 	// should not have created any providers
+	testAssertMethodCalled(t, mp, "Events", 0)
 	testAssertMethodCalled(t, mp, "Create", 0)
 	testAssertMethodCalled(t, mp, "Destroy", 0)
+}
+
+func TestParseConfigWithEvents(t *testing.T) {
+	e, mp := setupTests(t, nil)
+
+	events, err := e.Events()
+	require.NoError(t, err)
+
+	eventCount := 0
+	go func() {
+		for event := range events {
+			eventCount += 1
+			require.Equal(t, constants.LifecycleEventParsed, event.Status)
+		}
+	}()
+
+	r, err := e.ParseConfig("../../examples/single_file/container.hcl")
+	require.NoError(t, err)
+
+	require.Len(t, r.Resources, 6)
+
+	// should not have created any providers
+	testAssertMethodCalled(t, mp, "Create", 0)
+	testAssertMethodCalled(t, mp, "Destroy", 0)
+
+	require.Equal(t, 6, eventCount)
+	require.Empty(t, events)
 }
 
 func TestParseWithVariables(t *testing.T) {
@@ -474,6 +628,16 @@ func TestParseWithEnvironmentVariables(t *testing.T) {
 	c, err := e.config.FindResource("resource.container.consul")
 	require.NoError(t, err)
 	require.Equal(t, "consul:1.8.1", c.(*container.Container).Image.Name)
+}
+
+func TestMultipleEventsCallsFail(t *testing.T) {
+	e, _ := setupTests(t, nil)
+
+	_, err := e.Events()
+	require.NoError(t, err)
+
+	_, err = e.Events()
+	require.Error(t, err)
 }
 
 func testAssertMethodCalled(t *testing.T, p *mocks.Providers, method string, n int, resource ...types.Resource) {

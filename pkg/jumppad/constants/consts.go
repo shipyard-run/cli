@@ -18,3 +18,28 @@ const (
 	// resources have been created
 	StatusDisabled = "disabled"
 )
+
+type LifecycleEvent string
+
+const (
+	// LifecycleEventParsed is sent once the resource has been successfully parsed
+	LifecycleEventParsed LifecycleEvent = "parsed"
+
+	// LifecycleEventCreating is sent once the resource is about to be created
+	LifecycleEventCreating LifecycleEvent = "creating"
+
+	// LifecycleEventCreated is sent once the resource has been successfully created
+	LifecycleEventCreated LifecycleEvent = "created"
+
+	// LifecycleEventCreatedFailed is sent once the resource has failed to create
+	LifecycleEventCreatedFailed LifecycleEvent = "create_failed"
+
+	// LifecycleEventDestroying is sent once the resource is about to be destroyed
+	LifecycleEventDestroying LifecycleEvent = "destroying"
+
+	// LifecycleEventDestroyed is sent once the resource has been destroyed
+	LifecycleEventDestroyed LifecycleEvent = "destroyed"
+
+	// LifecycleEventDestroyFailed is sent once the resource has failed to create
+	LifecycleEventDestroyFailed LifecycleEvent = "destroy_failed"
+)
